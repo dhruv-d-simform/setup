@@ -114,6 +114,8 @@ alias filesh='nautilus "$(find ~ -type d \( -path "*/.*" -o -name "node_modules"
 alias vimf='vim $(fzfp)'
 alias tscw='tsc --outDir build --target es2015 --noEmitOnError --watch '
 alias empty='cat ~/Documents/invisiblechar.txt | xclip -selection clipboard'
+alias g='git status'
+alias gl='git log --oneline'
 
 bind -x '"\C-f": tmux-sessionizer'
 bind -x '"\C-o": code -r .'

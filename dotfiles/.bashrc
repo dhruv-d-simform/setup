@@ -158,3 +158,5 @@ export PATH="$PATH:~/.local/nvim-linux-x86_64/bin:$HOME/setup:$HOME/.local/scrip
 [ -f ~/.fzf.bash ] && source ~/.fzf.bash
 
 export LANG=en_IN.UTF-8
+
+. "$HOME/.local/bin/env"

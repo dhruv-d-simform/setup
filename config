@@ -58,6 +58,7 @@ copy_file "./dotfiles/.bashrc" "$HOME"
 copy_file "./dotfiles/.tmux.conf" "$HOME"
 copy_file "./dotfiles/.vimrc" "$HOME"
 copy_file "./dotfiles/.ready-tmux" "$HOME"
+copy_file "./dotfiles/.zshrc" "$HOME"
 
 copy_dir "./dotfiles/.config" "$HOME/.config"
 copy_dir "./.local" "$HOME/.local"

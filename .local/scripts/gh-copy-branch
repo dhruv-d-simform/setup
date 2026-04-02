@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Get current branch name
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Get remote origin URL
+remote=$(git config --get remote.origin.url)
+
+# Extract path part (user/repo or deeper)
+repo_path=$(echo "$remote" | sed -E 's#.*[:/]([^/]+/[^/]+)(\.git)?$#\1#')
+
+# Strip trailing .git if present (extra safety)
+repo_path=$(echo "$repo_path" | sed 's/\.git$//')
+
+if [[ -z "$repo_path" ]]; then
+    echo "Could not parse remote origin: $remote"
+    exit 1
+fi
+
+# Construct GitHub branch URL (always github.com, no .git suffix)
+url="https://github.com/${repo_path}/tree/${branch}"
+
+# Copy to clipboard
+echo -n "$url" | xclip -selection clipboard
+
+# Print confirmation
+echo "Copied to clipboard: $url"

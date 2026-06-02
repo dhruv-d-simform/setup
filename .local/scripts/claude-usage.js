@@ -58,30 +58,29 @@ async function fetchClaudeUsage(accessToken) {
 
     const data = await response.json();
 
-    const fiveHourUsage = data?.five_hour?.utilization;
-    const fiveHourResetTime = data?.five_hour?.resets_at;
+    const fiveHourUsageRaw = data?.five_hour?.utilization;
+    const fiveHourResetTimeRaw = data?.five_hour?.resets_at;
+    const sevenDayUsageRaw = data?.seven_day?.utilization;
+    const sevenDayResetTimeRaw = data?.seven_day?.resets_at;
 
-    const sevenDayUsage = data?.seven_day?.utilization;
-    const sevenDayResetTime = data?.seven_day?.resets_at;
+    const fiveHourUsage = typeof fiveHourUsageRaw === 'number' ? fiveHourUsageRaw : null;
+    const sevenDayUsage = typeof sevenDayUsageRaw === 'number' ? sevenDayUsageRaw : null;
 
-    if (typeof fiveHourUsage !== 'number' || typeof fiveHourResetTime !== 'string' ||
-        typeof sevenDayUsage !== 'number' || typeof sevenDayResetTime !== 'string') {
-        throw new Error('Unexpected response format from API.');
+    const fiveHourResetTimeParsed = typeof fiveHourResetTimeRaw === 'string' ? Date.parse(fiveHourResetTimeRaw) : NaN;
+    const sevenDayResetTimeParsed = typeof sevenDayResetTimeRaw === 'string' ? Date.parse(sevenDayResetTimeRaw) : NaN;
+
+    const fiveHourResetTime = !isNaN(fiveHourResetTimeParsed) ? new Date(fiveHourResetTimeParsed) : null;
+    const sevenDayResetTime = !isNaN(sevenDayResetTimeParsed) ? new Date(sevenDayResetTimeParsed) : null;
+
+    if (fiveHourUsage === null && fiveHourResetTime === null && sevenDayUsage === null && sevenDayResetTime === null) {
+        throw new Error('Unexpected response format from API: no usable fields found.');
     }
 
-    if (isNaN(Date.parse(fiveHourResetTime)) || isNaN(Date.parse(sevenDayResetTime))) {
-        throw new Error('Invalid reset time format in API response.');
-    }
-
-    return {
-        fiveHourUsage,
-        fiveHourResetTime: new Date(fiveHourResetTime),
-        sevenDayUsage,
-        sevenDayResetTime: new Date(sevenDayResetTime),
-    };
+    return { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime };
 }
 
 function formatResetCountdown(resetTime) {
+    if (resetTime == null) return 'N/A';
     const msLeft = resetTime - Date.now();
     const totalMins = Math.max(0, Math.floor(msLeft / 60000));
     const hours = Math.floor(totalMins / 60);
@@ -100,6 +99,7 @@ function formatResetCountdown(resetTime) {
 }
 
 function colorPercent(pct, forTmux = false) {
+    if (pct == null) return forTmux ? '#[fg=colour8]N/A#[default]' : '\x1b[2mN/A\x1b[0m';
     if (forTmux) {
         let color;
         if (pct < 40)       color = 'colour2';   // green
@@ -120,22 +120,34 @@ function formatUsageData(usageData) {
     const { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime } = usageData;
 
     switch (outputFormat) {
-        case 'json':
-            return JSON.stringify(usageData, null, 2);
+        case 'json': {
+            const jsonData = {
+                fiveHourUsage,
+                fiveHourResetTime: fiveHourResetTime?.toISOString() ?? null,
+                sevenDayUsage,
+                sevenDayResetTime: sevenDayResetTime?.toISOString() ?? null,
+            };
+            return JSON.stringify(jsonData, null, 2);
+        }
         case 'compact':
             return `5h:${colorPercent(fiveHourUsage)}(${formatResetCountdown(fiveHourResetTime)}) W:${colorPercent(sevenDayUsage)}(${formatResetCountdown(sevenDayResetTime)})`;
         case 'tmux':
             return `Claude ${colorPercent(fiveHourUsage, true)}(${formatResetCountdown(fiveHourResetTime)}) | ${colorPercent(sevenDayUsage, true)}(${formatResetCountdown(sevenDayResetTime)})`;
         case 'pretty':
-        default:
-            return  (
+        default: {
+            const fiveHourUsageStr = fiveHourUsage != null ? `${fiveHourUsage}%` : 'N/A';
+            const fiveHourResetStr = fiveHourResetTime != null ? fiveHourResetTime.toLocaleString() : 'N/A';
+            const sevenDayUsageStr = sevenDayUsage != null ? `${sevenDayUsage}%` : 'N/A';
+            const sevenDayResetStr = sevenDayResetTime != null ? sevenDayResetTime.toLocaleString() : 'N/A';
+            return (
 `Claude Usage
 ============
-5h Usage : ${fiveHourUsage}%
-5h Reset : ${fiveHourResetTime.toLocaleString()}
+5h Usage : ${fiveHourUsageStr}
+5h Reset : ${fiveHourResetStr}
 
-Week Usage : ${sevenDayUsage}%
-Week Reset : ${sevenDayResetTime.toLocaleString()}`);
+Week Usage : ${sevenDayUsageStr}
+Week Reset : ${sevenDayResetStr}`);
+        }
     }
 }
 
@@ -154,11 +166,7 @@ async function readCache() {
             return { rateLimited: true, retryAfterMs: cached.retryAfterMs, cachedAt: cached.cachedAt };
         }
 
-        if (typeof cached.cachedAt !== 'number' ||
-            typeof cached.fiveHourUsage !== 'number' ||
-            typeof cached.fiveHourResetTime !== 'string' ||
-            typeof cached.sevenDayUsage !== 'number' ||
-            typeof cached.sevenDayResetTime !== 'string') {
+        if (typeof cached.cachedAt !== 'number') {
             return null;
         }
 
@@ -166,19 +174,20 @@ async function readCache() {
             return null;
         }
 
-        const fiveHourResetTime = new Date(cached.fiveHourResetTime);
-        const sevenDayResetTime = new Date(cached.sevenDayResetTime);
+        const fiveHourUsage = typeof cached.fiveHourUsage === 'number' ? cached.fiveHourUsage : null;
+        const sevenDayUsage = typeof cached.sevenDayUsage === 'number' ? cached.sevenDayUsage : null;
 
-        if (isNaN(fiveHourResetTime.getTime()) || isNaN(sevenDayResetTime.getTime())) {
+        const fiveHourResetTimeParsed = typeof cached.fiveHourResetTime === 'string' ? Date.parse(cached.fiveHourResetTime) : NaN;
+        const sevenDayResetTimeParsed = typeof cached.sevenDayResetTime === 'string' ? Date.parse(cached.sevenDayResetTime) : NaN;
+
+        const fiveHourResetTime = !isNaN(fiveHourResetTimeParsed) ? new Date(fiveHourResetTimeParsed) : null;
+        const sevenDayResetTime = !isNaN(sevenDayResetTimeParsed) ? new Date(sevenDayResetTimeParsed) : null;
+
+        if (fiveHourUsage === null && fiveHourResetTime === null && sevenDayUsage === null && sevenDayResetTime === null) {
             return null;
         }
 
-        return {
-            fiveHourUsage: cached.fiveHourUsage,
-            fiveHourResetTime,
-            sevenDayUsage: cached.sevenDayUsage,
-            sevenDayResetTime,
-        };
+        return { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime };
     } catch {
         return null;
     }
@@ -187,10 +196,10 @@ async function readCache() {
 async function writeCache(usageData) {
     const cacheData = {
         cachedAt: Date.now(),
-        fiveHourUsage: usageData.fiveHourUsage,
-        fiveHourResetTime: usageData.fiveHourResetTime.toISOString(),
-        sevenDayUsage: usageData.sevenDayUsage,
-        sevenDayResetTime: usageData.sevenDayResetTime.toISOString(),
+        fiveHourUsage: usageData.fiveHourUsage ?? null,
+        fiveHourResetTime: usageData.fiveHourResetTime?.toISOString() ?? null,
+        sevenDayUsage: usageData.sevenDayUsage ?? null,
+        sevenDayResetTime: usageData.sevenDayResetTime?.toISOString() ?? null,
     };
     await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
 }

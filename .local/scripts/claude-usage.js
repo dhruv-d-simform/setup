@@ -9,20 +9,21 @@ const ANTHROPIC_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_FILE = path.join(os.tmpdir(), 'claude-usage-cache.json');
 const CACHE_DURATION_MS = 180 * 1000;
 const RATE_LIMIT_DEFAULT_RETRY_MS = 15 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 10 * 1000;
 
-const OUTPUT_FORMATS = [
-    'json',
-    'compact',
-    'tmux',
-    'pretty',
-    'clear-cache',
-];
+const OUTPUT_FORMATS = ['json', 'compact', 'tmux', 'pretty'];
 
-let outputFormat = process.argv[2] || 'pretty';
-if (!OUTPUT_FORMATS.includes(outputFormat)) {
+const argv = process.argv.slice(2);
+const noCache = argv.includes('--no-cache');
+const clearCache = argv.includes('--clear-cache');
+const formatArg = argv.find(a => !a.startsWith('--')) ?? 'pretty';
+
+if (!OUTPUT_FORMATS.includes(formatArg)) {
     console.error(`Invalid output format. Supported formats: ${OUTPUT_FORMATS.join(', ')}`);
     process.exit(1);
 }
+
+const outputFormat = formatArg;
 
 async function readCredentials() {
     const credentials = JSON.parse(await fs.readFile(credentialsFilePath, 'utf-8'));
@@ -36,11 +37,21 @@ async function readCredentials() {
 }
 
 async function fetchClaudeUsage(accessToken) {
-    const response = await fetch(ANTHROPIC_API_URL, {
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-        }
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    let response;
+    try {
+        response = await fetch(ANTHROPIC_API_URL, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            signal: controller.signal,
+        });
+    } catch (err) {
+        if (err.name === 'AbortError') throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS / 1000}s.`);
+        throw err;
+    } finally {
+        clearTimeout(timeout);
+    }
 
     if (response.status === 429) {
         const retryAfterHeader = response.headers.get('Retry-After');
@@ -98,26 +109,57 @@ function formatResetCountdown(resetTime) {
     return `${days} ${h12}:${m}${ampm}`;
 }
 
-function colorPercent(pct, forTmux = false) {
-    if (pct == null) return forTmux ? '#[fg=colour8]N/A#[default]' : '\x1b[2mN/A\x1b[0m';
+function formatCacheAge(cachedAt) {
+    const totalMins = Math.floor((Date.now() - cachedAt) / 60000);
+    if (totalMins === 0) return 'just now';
+    if (totalMins < 60) return `${totalMins}m ago`;
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    return mins > 0 ? `${hours}h${mins}m ago` : `${hours}h ago`;
+}
+
+function colorPercent(pct, forTmux = false, padWidth = 0) {
+    const raw = pct != null ? `${pct}%` : 'N/A';
+    const str = padWidth > 0 ? raw.padStart(padWidth) : raw;
+    if (pct == null) return forTmux ? `#[fg=colour8]${str}#[default]` : `\x1b[2m${str}\x1b[0m`;
     if (forTmux) {
         let color;
-        if (pct < 40)       color = 'colour2';   // green
-        else if (pct < 65)  color = 'colour3';   // yellow
-        else if (pct < 80)  color = 'colour208'; // orange
-        else                color = 'colour1';   // red
-        return `#[fg=${color}]${pct}%#[default]`;
+        if (pct < 40)       color = 'colour2';
+        else if (pct < 65)  color = 'colour3';
+        else if (pct < 80)  color = 'colour208';
+        else                color = 'colour1';
+        return `#[fg=${color}]${str}#[default]`;
     }
     let code;
     if (pct < 40)       code = '\x1b[32m';
     else if (pct < 65)  code = '\x1b[33m';
     else if (pct < 80)  code = '\x1b[38;5;208m';
     else                code = '\x1b[31m';
-    return `${code}${pct}%\x1b[0m`;
+    return `${code}${str}\x1b[0m`;
+}
+
+function progressBar(pct, width, forTmux = false) {
+    const filled = pct != null ? Math.round((pct / 100) * width) : 0;
+    const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+    if (pct == null) return forTmux ? `#[fg=colour8]${bar}#[default]` : `\x1b[2m${bar}\x1b[0m`;
+    if (forTmux) {
+        let color;
+        if (pct < 40)       color = 'colour2';
+        else if (pct < 65)  color = 'colour3';
+        else if (pct < 80)  color = 'colour208';
+        else                color = 'colour1';
+        return `#[fg=${color}]${bar}#[default]`;
+    }
+    let code;
+    if (pct < 40)       code = '\x1b[32m';
+    else if (pct < 65)  code = '\x1b[33m';
+    else if (pct < 80)  code = '\x1b[38;5;208m';
+    else                code = '\x1b[31m';
+    return `${code}${bar}\x1b[0m`;
 }
 
 function formatUsageData(usageData) {
-    const { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime } = usageData;
+    const { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime, cachedAt } = usageData;
 
     switch (outputFormat) {
         case 'json': {
@@ -126,27 +168,32 @@ function formatUsageData(usageData) {
                 fiveHourResetTime: fiveHourResetTime?.toISOString() ?? null,
                 sevenDayUsage,
                 sevenDayResetTime: sevenDayResetTime?.toISOString() ?? null,
+                cachedAt: cachedAt != null ? new Date(cachedAt).toISOString() : null,
             };
             return JSON.stringify(jsonData, null, 2);
         }
-        case 'compact':
-            return `5h:${colorPercent(fiveHourUsage)}(${formatResetCountdown(fiveHourResetTime)}) W:${colorPercent(sevenDayUsage)}(${formatResetCountdown(sevenDayResetTime)})`;
-        case 'tmux':
-            return `Claude ${colorPercent(fiveHourUsage, true)}(${formatResetCountdown(fiveHourResetTime)}) | ${colorPercent(sevenDayUsage, true)}(${formatResetCountdown(sevenDayResetTime)})`;
+        case 'compact': {
+            const D = '\x1b[2m', R = '\x1b[0m';
+            const fhPart = `5h: ${colorPercent(fiveHourUsage)} ${progressBar(fiveHourUsage, 10)} ${D}→ ${formatResetCountdown(fiveHourResetTime)}${R}`;
+            const sdPart = `7d: ${colorPercent(sevenDayUsage)} ${progressBar(sevenDayUsage, 10)} ${D}→ ${formatResetCountdown(sevenDayResetTime)}${R}`;
+            const cacheStr = cachedAt != null ? `  ${D}💾 ${formatCacheAge(cachedAt)}${R}` : '';
+            return `⚡  ${fhPart}  ${D}·${R}  ${sdPart}${cacheStr}`;
+        }
+        case 'tmux': {
+            const dim = (s) => `#[fg=colour8]${s}#[default]`;
+            const fhPart = `${colorPercent(fiveHourUsage, true)}(${formatResetCountdown(fiveHourResetTime)})`;
+            const sdPart = `${colorPercent(sevenDayUsage, true)}(${formatResetCountdown(sevenDayResetTime)})`;
+            const cacheStr = cachedAt != null ? ` ${dim(`~${formatCacheAge(cachedAt)}`)}` : '';
+            return `#[fg=colour173]Claude#[default] ${fhPart} ${sdPart}${cacheStr}`;
+        }
         case 'pretty':
         default: {
-            const fiveHourUsageStr = fiveHourUsage != null ? `${fiveHourUsage}%` : 'N/A';
-            const fiveHourResetStr = fiveHourResetTime != null ? fiveHourResetTime.toLocaleString() : 'N/A';
-            const sevenDayUsageStr = sevenDayUsage != null ? `${sevenDayUsage}%` : 'N/A';
-            const sevenDayResetStr = sevenDayResetTime != null ? sevenDayResetTime.toLocaleString() : 'N/A';
-            return (
-`Claude Usage
-============
-5h Usage : ${fiveHourUsageStr}
-5h Reset : ${fiveHourResetStr}
-
-Week Usage : ${sevenDayUsageStr}
-Week Reset : ${sevenDayResetStr}`);
+            const D = '\x1b[2m', B = '\x1b[1m', R = '\x1b[0m';
+            const sep = `${D}${'─'.repeat(50)}${R}`;
+            const fhRow = `  🕐  5h   ${colorPercent(fiveHourUsage, false, 4)}  ${progressBar(fiveHourUsage, 20)}  ${D}→  ${formatResetCountdown(fiveHourResetTime)}${R}`;
+            const sdRow = `  📅  7d   ${colorPercent(sevenDayUsage, false, 4)}  ${progressBar(sevenDayUsage, 20)}  ${D}→  ${formatResetCountdown(sevenDayResetTime)}${R}`;
+            const cacheRow = cachedAt != null ? `\n  ${D}💾 cached ${formatCacheAge(cachedAt)}${R}` : '';
+            return `${B}⚡ Claude Usage${R}\n${sep}\n${fhRow}\n${sdRow}\n${sep}${cacheRow}`;
         }
     }
 }
@@ -187,7 +234,7 @@ async function readCache() {
             return null;
         }
 
-        return { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime };
+        return { fiveHourUsage, fiveHourResetTime, sevenDayUsage, sevenDayResetTime, cachedAt: cached.cachedAt };
     } catch {
         return null;
     }
@@ -217,10 +264,7 @@ async function deleteCache() {
     try {
         await fs.unlink(CACHE_FILE);
     } catch (err) {
-        if (err.code === 'ENOENT') {
-        } else {
-            throw err;
-        }
+        if (err.code !== 'ENOENT') throw err;
     }
 }
 
@@ -237,12 +281,13 @@ function handleRateLimited(cachedAt, retryAfterMs) {
 
 async function main() {
     try {
-        if (outputFormat === 'clear-cache') {
+        if (clearCache) {
             await deleteCache();
+            console.log('Cache cleared.');
             return;
         }
 
-        const cached = await readCache();
+        const cached = noCache ? null : await readCache();
 
         if (cached?.rateLimited) {
             handleRateLimited(cached.cachedAt, cached.retryAfterMs);
@@ -250,7 +295,7 @@ async function main() {
         }
 
         let usageData;
-        if (outputFormat === 'tmux' && cached) {
+        if (cached) {
             usageData = cached;
         } else {
             const accessToken = await readCredentials();
@@ -261,9 +306,7 @@ async function main() {
                 return;
             }
             usageData = result;
-            if (outputFormat === 'tmux') {
-                await writeCache(usageData);
-            }
+            await writeCache(usageData);
         }
 
         const formattedOutput = formatUsageData(usageData);

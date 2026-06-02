@@ -6,12 +6,15 @@ import path from 'node:path';
 
 const credentialsFilePath = path.join(os.homedir(), '.claude', '.credentials.json');
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/api/oauth/usage';
+const CACHE_FILE = path.join(os.tmpdir(), 'claude-usage-cache.json');
+const CACHE_DURATION_MS = 30 * 1000;
 
 const OUTPUT_FORMATS = [
     'json',
     'compact',
     'tmux',
     'pretty',
+    'clear-cache',
 ];
 
 let outputFormat = process.argv[2] || 'pretty';
@@ -85,12 +88,20 @@ function formatResetCountdown(resetTime) {
     return `${days} ${h12}:${m}${ampm}`;
 }
 
-function colorPercent(pct) {
+function colorPercent(pct, forTmux = false) {
+    if (forTmux) {
+        let color;
+        if (pct < 40)       color = 'colour2';   // green
+        else if (pct < 65)  color = 'colour3';   // yellow
+        else if (pct < 80)  color = 'colour208'; // orange
+        else                color = 'colour1';   // red
+        return `#[fg=${color}]${pct}%#[default]`;
+    }
     let code;
-    if (pct < 40)       code = '\x1b[32m';   // green
-    else if (pct < 65)  code = '\x1b[33m';   // yellow
-    else if (pct < 80)  code = '\x1b[38;5;208m'; // orange
-    else                code = '\x1b[31m';   // red
+    if (pct < 40)       code = '\x1b[32m';
+    else if (pct < 65)  code = '\x1b[33m';
+    else if (pct < 80)  code = '\x1b[38;5;208m';
+    else                code = '\x1b[31m';
     return `${code}${pct}%\x1b[0m`;
 }
 
@@ -103,7 +114,7 @@ function formatUsageData(usageData) {
         case 'compact':
             return `5h:${colorPercent(fiveHourUsage)}(${formatResetCountdown(fiveHourResetTime)}) W:${colorPercent(sevenDayUsage)}(${formatResetCountdown(sevenDayResetTime)})`;
         case 'tmux':
-            return `CC ${colorPercent(fiveHourUsage)}(${formatResetCountdown(fiveHourResetTime)}) | ${colorPercent(sevenDayUsage)}(${formatResetCountdown(sevenDayResetTime)})`;
+            return `Claude ${colorPercent(fiveHourUsage, true)}(${formatResetCountdown(fiveHourResetTime)}) | ${colorPercent(sevenDayUsage, true)}(${formatResetCountdown(sevenDayResetTime)})`;
         case 'pretty':
         default:
             return  (
@@ -117,10 +128,83 @@ Week Reset : ${sevenDayResetTime.toLocaleString()}`);
     }
 }
 
+async function readCache() {
+    try {
+        const raw = await fs.readFile(CACHE_FILE, 'utf-8');
+        const cached = JSON.parse(raw);
+
+        if (typeof cached.cachedAt !== 'number' ||
+            typeof cached.fiveHourUsage !== 'number' ||
+            typeof cached.fiveHourResetTime !== 'string' ||
+            typeof cached.sevenDayUsage !== 'number' ||
+            typeof cached.sevenDayResetTime !== 'string') {
+            return null;
+        }
+
+        if (Date.now() - cached.cachedAt > CACHE_DURATION_MS) {
+            return null;
+        }
+
+        const fiveHourResetTime = new Date(cached.fiveHourResetTime);
+        const sevenDayResetTime = new Date(cached.sevenDayResetTime);
+
+        if (isNaN(fiveHourResetTime.getTime()) || isNaN(sevenDayResetTime.getTime())) {
+            return null;
+        }
+
+        return {
+            fiveHourUsage: cached.fiveHourUsage,
+            fiveHourResetTime,
+            sevenDayUsage: cached.sevenDayUsage,
+            sevenDayResetTime,
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function writeCache(usageData) {
+    const cacheData = {
+        cachedAt: Date.now(),
+        fiveHourUsage: usageData.fiveHourUsage,
+        fiveHourResetTime: usageData.fiveHourResetTime.toISOString(),
+        sevenDayUsage: usageData.sevenDayUsage,
+        sevenDayResetTime: usageData.sevenDayResetTime.toISOString(),
+    };
+    await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
+}
+
+async function deleteCache() {
+    try {
+        await fs.unlink(CACHE_FILE);
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+        } else {
+            throw err;
+        }
+    }
+}
+
 async function main() {
     try {
-        const accessToken = await readCredentials();
-        const usageData = await fetchClaudeUsage(accessToken);
+        if (outputFormat === 'clear-cache') {
+            await deleteCache();
+            return;
+        }
+
+        let usageData;
+        if (outputFormat === 'tmux') {
+            usageData = await readCache();
+            if (!usageData) {
+                const accessToken = await readCredentials();
+                usageData = await fetchClaudeUsage(accessToken);
+                await writeCache(usageData);
+            }
+        } else {
+            const accessToken = await readCredentials();
+            usageData = await fetchClaudeUsage(accessToken);
+        }
+
         const formattedOutput = formatUsageData(usageData);
         console.log(formattedOutput);
     } catch (err) {

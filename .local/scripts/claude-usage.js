@@ -7,7 +7,7 @@ import path from 'node:path';
 const credentialsFilePath = path.join(os.homedir(), '.claude', '.credentials.json');
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_FILE = path.join(os.tmpdir(), 'claude-usage-cache.json');
-const CACHE_DURATION_MS = 30 * 1000;
+const CACHE_DURATION_MS = 180 * 1000;
 
 const OUTPUT_FORMATS = [
     'json',

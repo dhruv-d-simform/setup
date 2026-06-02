@@ -8,6 +8,7 @@ const credentialsFilePath = path.join(os.homedir(), '.claude', '.credentials.jso
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_FILE = path.join(os.tmpdir(), 'claude-usage-cache.json');
 const CACHE_DURATION_MS = 180 * 1000;
+const RATE_LIMIT_DEFAULT_RETRY_MS = 15 * 60 * 1000;
 
 const OUTPUT_FORMATS = [
     'json',
@@ -40,6 +41,16 @@ async function fetchClaudeUsage(accessToken) {
             Authorization: `Bearer ${accessToken}`,
         }
     });
+
+    if (response.status === 429) {
+        const retryAfterHeader = response.headers.get('Retry-After');
+        let retryAfterMs = RATE_LIMIT_DEFAULT_RETRY_MS;
+        if (retryAfterHeader) {
+            const seconds = parseInt(retryAfterHeader, 10);
+            if (!isNaN(seconds) && seconds > 0) retryAfterMs = seconds * 1000;
+        }
+        return { rateLimited: true, retryAfterMs };
+    }
 
     if (!response.ok) {
         throw new Error(`Failed to fetch usage data: ${response.status} ${response.statusText}`);
@@ -133,6 +144,16 @@ async function readCache() {
         const raw = await fs.readFile(CACHE_FILE, 'utf-8');
         const cached = JSON.parse(raw);
 
+        if (cached.rateLimited === true) {
+            if (typeof cached.cachedAt !== 'number' || typeof cached.retryAfterMs !== 'number') {
+                return null;
+            }
+            if (Date.now() - cached.cachedAt > cached.retryAfterMs) {
+                return null;
+            }
+            return { rateLimited: true, retryAfterMs: cached.retryAfterMs, cachedAt: cached.cachedAt };
+        }
+
         if (typeof cached.cachedAt !== 'number' ||
             typeof cached.fiveHourUsage !== 'number' ||
             typeof cached.fiveHourResetTime !== 'string' ||
@@ -174,6 +195,15 @@ async function writeCache(usageData) {
     await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
 }
 
+async function writeRateLimitedCache(retryAfterMs) {
+    const cacheData = {
+        rateLimited: true,
+        cachedAt: Date.now(),
+        retryAfterMs,
+    };
+    await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
+}
+
 async function deleteCache() {
     try {
         await fs.unlink(CACHE_FILE);
@@ -185,6 +215,17 @@ async function deleteCache() {
     }
 }
 
+function handleRateLimited(cachedAt, retryAfterMs) {
+    const retryAt = new Date(cachedAt + retryAfterMs);
+    const countdown = formatResetCountdown(retryAt);
+    if (outputFormat === 'tmux') {
+        console.log(`Claude #[fg=colour1]rate limited#[default](${countdown})`);
+    } else {
+        console.error(`Rate limited. Retry in ${countdown}`);
+        process.exit(1);
+    }
+}
+
 async function main() {
     try {
         if (outputFormat === 'clear-cache') {
@@ -192,17 +233,28 @@ async function main() {
             return;
         }
 
+        const cached = await readCache();
+
+        if (cached?.rateLimited) {
+            handleRateLimited(cached.cachedAt, cached.retryAfterMs);
+            return;
+        }
+
         let usageData;
-        if (outputFormat === 'tmux') {
-            usageData = await readCache();
-            if (!usageData) {
-                const accessToken = await readCredentials();
-                usageData = await fetchClaudeUsage(accessToken);
-                await writeCache(usageData);
-            }
+        if (outputFormat === 'tmux' && cached) {
+            usageData = cached;
         } else {
             const accessToken = await readCredentials();
-            usageData = await fetchClaudeUsage(accessToken);
+            const result = await fetchClaudeUsage(accessToken);
+            if (result.rateLimited) {
+                await writeRateLimitedCache(result.retryAfterMs);
+                handleRateLimited(Date.now(), result.retryAfterMs);
+                return;
+            }
+            usageData = result;
+            if (outputFormat === 'tmux') {
+                await writeCache(usageData);
+            }
         }
 
         const formattedOutput = formatUsageData(usageData);

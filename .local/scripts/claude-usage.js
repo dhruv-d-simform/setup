@@ -28,12 +28,18 @@ const outputFormat = formatArg;
 async function readCredentials() {
     const credentials = JSON.parse(await fs.readFile(credentialsFilePath, 'utf-8'));
     const accessToken = credentials?.claudeAiOauth?.accessToken;
+    const expiresAt = credentials?.claudeAiOauth?.expiresAt;
 
     if (!accessToken || typeof accessToken !== 'string') {
         throw new Error('Access token not found in credentials file.');
     }
 
-    return accessToken;
+    return { accessToken, expiresAt };
+}
+
+function isTokenExpired(expiresAt) {
+    if (typeof expiresAt !== 'number') return false;
+    return Date.now() >= expiresAt;
 }
 
 async function fetchClaudeUsage(accessToken) {
@@ -101,7 +107,7 @@ function formatResetCountdown(resetTime) {
     if (totalMins < 60) return `${mins}m`;
     if (msLeft < 24 * 3600 * 1000) return hours > 0 ? `${hours}h${mins > 0 ? `${mins}m` : ''}` : `${mins}m`;
 
-    const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][resetTime.getDay()];
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][resetTime.getDay()];
     const h = resetTime.getHours();
     const m = resetTime.getMinutes().toString().padStart(2, '0');
     const ampm = h >= 12 ? 'PM' : 'AM';
@@ -124,17 +130,17 @@ function colorPercent(pct, forTmux = false, padWidth = 0) {
     if (pct == null) return forTmux ? `#[fg=colour8]${str}#[default]` : `\x1b[2m${str}\x1b[0m`;
     if (forTmux) {
         let color;
-        if (pct < 40)       color = 'colour2';
-        else if (pct < 65)  color = 'colour3';
-        else if (pct < 80)  color = 'colour208';
-        else                color = 'colour1';
+        if (pct < 40) color = 'colour2';
+        else if (pct < 65) color = 'colour3';
+        else if (pct < 80) color = 'colour208';
+        else color = 'colour1';
         return `#[fg=${color}]${str}#[default]`;
     }
     let code;
-    if (pct < 40)       code = '\x1b[32m';
-    else if (pct < 65)  code = '\x1b[33m';
-    else if (pct < 80)  code = '\x1b[38;5;208m';
-    else                code = '\x1b[31m';
+    if (pct < 40) code = '\x1b[32m';
+    else if (pct < 65) code = '\x1b[33m';
+    else if (pct < 80) code = '\x1b[38;5;208m';
+    else code = '\x1b[31m';
     return `${code}${str}\x1b[0m`;
 }
 
@@ -144,17 +150,17 @@ function progressBar(pct, width, forTmux = false) {
     if (pct == null) return forTmux ? `#[fg=colour8]${bar}#[default]` : `\x1b[2m${bar}\x1b[0m`;
     if (forTmux) {
         let color;
-        if (pct < 40)       color = 'colour2';
-        else if (pct < 65)  color = 'colour3';
-        else if (pct < 80)  color = 'colour208';
-        else                color = 'colour1';
+        if (pct < 40) color = 'colour2';
+        else if (pct < 65) color = 'colour3';
+        else if (pct < 80) color = 'colour208';
+        else color = 'colour1';
         return `#[fg=${color}]${bar}#[default]`;
     }
     let code;
-    if (pct < 40)       code = '\x1b[32m';
-    else if (pct < 65)  code = '\x1b[33m';
-    else if (pct < 80)  code = '\x1b[38;5;208m';
-    else                code = '\x1b[31m';
+    if (pct < 40) code = '\x1b[32m';
+    else if (pct < 65) code = '\x1b[33m';
+    else if (pct < 80) code = '\x1b[38;5;208m';
+    else code = '\x1b[31m';
     return `${code}${bar}\x1b[0m`;
 }
 
@@ -202,6 +208,10 @@ async function readCache() {
     try {
         const raw = await fs.readFile(CACHE_FILE, 'utf-8');
         const cached = JSON.parse(raw);
+
+        if (cached.tokenExpired === true) {
+            return { tokenExpired: true, cachedAt: cached.cachedAt };
+        }
 
         if (cached.rateLimited === true) {
             if (typeof cached.cachedAt !== 'number' || typeof cached.retryAfterMs !== 'number') {
@@ -251,6 +261,14 @@ async function writeCache(usageData) {
     await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
 }
 
+async function writeTokenExpiredCache() {
+    const cacheData = {
+        tokenExpired: true,
+        cachedAt: Date.now(),
+    };
+    await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2), 'utf-8');
+}
+
 async function writeRateLimitedCache(retryAfterMs) {
     const cacheData = {
         rateLimited: true,
@@ -265,6 +283,15 @@ async function deleteCache() {
         await fs.unlink(CACHE_FILE);
     } catch (err) {
         if (err.code !== 'ENOENT') throw err;
+    }
+}
+
+function handleTokenExpired() {
+    if (outputFormat === 'tmux') {
+        console.log(`#[fg=colour173]Claude#[default] #[fg=colour1]token expired#[default]`);
+    } else {
+        console.error('Access token has expired. Please use claude code to generate a new token.');
+        process.exit(1);
     }
 }
 
@@ -295,10 +322,31 @@ async function main() {
         }
 
         let usageData;
-        if (cached) {
+        if (cached?.tokenExpired) {
+            // Cache says expired — verify against actual credentials file in case token was refreshed
+            const { accessToken, expiresAt } = await readCredentials();
+            if (isTokenExpired(expiresAt)) {
+                handleTokenExpired();
+                return;
+            }
+            // Token was refreshed since we last checked — proceed normally
+            const result = await fetchClaudeUsage(accessToken);
+            if (result.rateLimited) {
+                await writeRateLimitedCache(result.retryAfterMs);
+                handleRateLimited(Date.now(), result.retryAfterMs);
+                return;
+            }
+            usageData = result;
+            await writeCache(usageData);
+        } else if (cached) {
             usageData = cached;
         } else {
-            const accessToken = await readCredentials();
+            const { accessToken, expiresAt } = await readCredentials();
+            if (isTokenExpired(expiresAt)) {
+                await writeTokenExpiredCache();
+                handleTokenExpired();
+                return;
+            }
             const result = await fetchClaudeUsage(accessToken);
             if (result.rateLimited) {
                 await writeRateLimitedCache(result.retryAfterMs);
